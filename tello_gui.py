@@ -3,6 +3,7 @@ from tkinter import ttk, messagebox
 import threading
 import time
 import cv2
+import queue
 from PIL import Image, ImageTk
 from djitellopy import Tello
 from tello_mock import MockTello
@@ -17,6 +18,12 @@ class TelloGUI:
         self.is_connected = False
         self.video_thread_running = False
         self.status_thread_running = False
+
+        # Command Queue
+        self.command_queue = queue.Queue()
+        self.queue_thread_running = True
+        self.is_executing_blocking_cmd = False # Flag for UI locking
+        threading.Thread(target=self._command_worker, daemon=True).start()
 
         # UI Variables
         self.ip_var = tk.StringVar(value="192.168.10.1")
@@ -71,71 +78,69 @@ class TelloGUI:
         action_frame = ttk.LabelFrame(control_panel, text="基本动作")
         action_frame.pack(fill="x", pady=5)
 
-        ttk.Button(action_frame, text="起飞 (Takeoff)", command=lambda: self.send_command(self.tello.takeoff)).pack(fill="x", padx=5, pady=2)
-        ttk.Button(action_frame, text="降落 (Land)", command=lambda: self.send_command(self.tello.land)).pack(fill="x", padx=5, pady=2)
+        # We store buttons in list to easily disable/enable
+        self.action_buttons = []
+
+        btn_takeoff = ttk.Button(action_frame, text="起飞 (Takeoff)", command=lambda: self.send_command(self.tello.takeoff, blocking=True))
+        btn_takeoff.pack(fill="x", padx=5, pady=2)
+        self.action_buttons.append(btn_takeoff)
+
+        btn_land = ttk.Button(action_frame, text="降落 (Land)", command=lambda: self.send_command(self.tello.land, blocking=True))
+        btn_land.pack(fill="x", padx=5, pady=2)
+        self.action_buttons.append(btn_land)
+
         btn_stop = tk.Button(action_frame, text="紧急停止 (EMERGENCY)", bg="red", fg="white", command=self.on_emergency)
         btn_stop.pack(fill="x", padx=5, pady=5)
+        # Stop is NOT added to action_buttons list because it should always be enabled
 
         # Direction Control
         rc_frame = ttk.LabelFrame(control_panel, text="飞行控制")
         rc_frame.pack(fill="x", pady=5)
 
         # Grid for directional buttons
-        # Layout:
-        #      [Fwd]          [Up]
-        # [Left]   [Right]  [RotL] [RotR]
-        #      [Back]         [Down]
-
         btn_w = 6
 
+        # Helper to create RC button
+        def create_rc_btn(txt, r, c, lr, fb, ud, y):
+            btn = ttk.Button(rc_frame, text=txt, width=btn_w, command=lambda: self.send_rc(lr, fb, ud, y))
+            btn.grid(row=r, column=c, pady=2)
+            self.action_buttons.append(btn)
+
         # Position / Movement (WASD equivalent)
-        ttk.Button(rc_frame, text="前", width=btn_w, command=lambda: self.send_rc(0, 30, 0, 0)).grid(row=0, column=1, pady=2)
-        ttk.Button(rc_frame, text="左", width=btn_w, command=lambda: self.send_rc(-30, 0, 0, 0)).grid(row=1, column=0, pady=2)
-        ttk.Button(rc_frame, text="右", width=btn_w, command=lambda: self.send_rc(30, 0, 0, 0)).grid(row=1, column=2, pady=2)
-        ttk.Button(rc_frame, text="后", width=btn_w, command=lambda: self.send_rc(0, -30, 0, 0)).grid(row=2, column=1, pady=2)
+        create_rc_btn("前", 0, 1, 0, 30, 0, 0)
+        create_rc_btn("左", 1, 0, -30, 0, 0, 0)
+        create_rc_btn("右", 1, 2, 30, 0, 0, 0)
+        create_rc_btn("后", 2, 1, 0, -30, 0, 0)
 
         # Separator or Space
         ttk.Label(rc_frame, text="   ").grid(row=0, column=3)
 
         # Altitude / Rotation
-        ttk.Button(rc_frame, text="上升", width=btn_w, command=lambda: self.send_rc(0, 0, 30, 0)).grid(row=0, column=4, pady=2)
-        ttk.Button(rc_frame, text="左旋", width=btn_w, command=lambda: self.send_rc(0, 0, 0, -30)).grid(row=1, column=3, pady=2) # column 3 overlaps separator? adjust
-        ttk.Button(rc_frame, text="右旋", width=btn_w, command=lambda: self.send_rc(0, 0, 0, 30)).grid(row=1, column=5, pady=2)
-        ttk.Button(rc_frame, text="下降", width=btn_w, command=lambda: self.send_rc(0, 0, -30, 0)).grid(row=2, column=4, pady=2)
+        create_rc_btn("上升", 0, 4, 0, 0, 30, 0)
+        create_rc_btn("左旋", 1, 3, 0, 0, 0, -30)
+        create_rc_btn("右旋", 1, 5, 0, 0, 0, 30)
+        create_rc_btn("下降", 2, 4, 0, 0, -30, 0)
 
         # Stop RC
-        ttk.Button(rc_frame, text="悬停 (Stop)", command=lambda: self.send_rc(0, 0, 0, 0)).grid(row=3, column=0, columnspan=6, sticky="ew", pady=5)
+        btn_hover = ttk.Button(rc_frame, text="悬停 (Stop)", command=lambda: self.send_rc(0, 0, 0, 0))
+        btn_hover.grid(row=3, column=0, columnspan=6, sticky="ew", pady=5)
+        self.action_buttons.append(btn_hover)
 
         # Instructions
         ttk.Label(control_panel, text="提示: 请先连接无人机。\n默认端口8889。", font=("Arial", 9), wraplength=200).pack(pady=10)
 
     def on_connect(self):
         ip = self.ip_var.get()
-        # Port is not directly used in constructor but often needed if modified in library,
-        # djitellopy usually defaults to 8889. We pass host.
-
         if self.use_mock_var.get():
             print("Using Mock Tello")
             self.tello = MockTello(host=ip)
         else:
             print(f"Connecting to Real Tello at {ip}")
-            # djitellopy Tello() uses host for command IP.
-            # It expects ports 8889 (cmd) and 11111 (state) and 11111 (video).
-            # We can attempt to override if the user specifies a different port,
-            # though standard Tello is fixed.
             self.tello = Tello(host=ip)
-
             try:
                 port = int(self.port_var.get())
                 if port != 8889:
-                     # djitellopy 2.5.0 might not support changing port easily via constructor
-                     # but we can try to set the internal address if possible, or just log a warning.
-                     # Examining djitellopy source is not possible here, but usually it's hardcoded or kwargs.
-                     # We will attempt to set the address property if it exists or just warn.
                      print(f"Warning: Custom port {port} requested. Standard Tello port is 8889.")
-                     # If the library supported it, we would do: self.tello.tello_address = (ip, port)
-                     # For now, we respect the user input by at least trying to use it if the library allows,
-                     # otherwise we proceed with standard behavior.
                      self.tello.tello_addr = (ip, port)
             except ValueError:
                 print("Invalid port, using default 8889")
@@ -143,7 +148,6 @@ class TelloGUI:
         self.btn_connect.config(state="disabled")
         self.status_var.set("状态: 连接中...")
 
-        # Thread the connection
         threading.Thread(target=self._connect_thread, daemon=True).start()
 
     def _connect_thread(self):
@@ -152,14 +156,12 @@ class TelloGUI:
             self.tello.streamon()
             self.is_connected = True
 
-            # Start background loops
             self.video_thread_running = True
             threading.Thread(target=self._video_loop, daemon=True).start()
 
             self.status_thread_running = True
             threading.Thread(target=self._status_loop, daemon=True).start()
 
-            # Update UI
             self.root.after(0, lambda: self._update_connection_ui(True))
         except Exception as e:
             print(f"Connection failed: {e}")
@@ -180,7 +182,6 @@ class TelloGUI:
         self.video_thread_running = False
         self.status_thread_running = False
         if self.tello:
-            # self.tello.streamoff() # Might block
             self.tello = None
         self.is_connected = False
         self.status_var.set("状态: 已断开")
@@ -196,30 +197,21 @@ class TelloGUI:
                 if frame_reader is None:
                     time.sleep(0.1)
                     continue
-
                 frame = frame_reader.frame
                 if frame is not None:
-                    # Resize to fit (keep aspect ratio roughly)
-                    # Tello is 960x720. Let's resize to 640x480 for UI
                     img = cv2.resize(frame, (640, 480))
-                    # Convert to RGB
                     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                    # Convert to PIL
                     img_pil = Image.fromarray(img)
-
-                    # Pass the PIL Image to the main thread
                     self.root.after(0, self._update_video_label, img_pil)
-
-                time.sleep(0.03) # ~30 FPS
+                time.sleep(0.03)
             except Exception as e:
                 print(f"Video loop error: {e}")
                 time.sleep(1)
 
     def _update_video_label(self, img_pil):
-        # Create ImageTk in main thread
         img_tk = ImageTk.PhotoImage(image=img_pil)
         self.video_label.configure(image=img_tk)
-        self.video_label.image = img_tk # Keep reference
+        self.video_label.image = img_tk
 
     def _status_loop(self):
         while self.status_thread_running:
@@ -229,31 +221,85 @@ class TelloGUI:
                     self.root.after(0, lambda b=bat: self.battery_var.set(f"电量: {b}%"))
                 except:
                     pass
-            time.sleep(5) # Update every 5 seconds
+            time.sleep(5)
 
-    def send_command(self, func, *args):
+    # --- Command Queue Logic ---
+
+    def _command_worker(self):
+        """Worker thread to process commands sequentially."""
+        while self.queue_thread_running:
+            try:
+                # Get command from queue
+                cmd_item = self.command_queue.get(timeout=1)
+                func, args, is_blocking = cmd_item
+
+                if is_blocking:
+                    # Signal UI to lock
+                    self.root.after(0, lambda: self._set_ui_busy(True))
+
+                try:
+                    func(*args)
+                except Exception as e:
+                    print(f"Command execution error: {e}")
+
+                if is_blocking:
+                    # Signal UI to unlock
+                    self.root.after(0, lambda: self._set_ui_busy(False))
+
+                self.command_queue.task_done()
+
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"Worker error: {e}")
+
+    def _set_ui_busy(self, busy):
+        """Enable or disable action buttons."""
+        self.is_executing_blocking_cmd = busy
+        state = "disabled" if busy else "normal"
+
+        status_text = "状态: 执行指令中..." if busy else "状态: 已连接"
+        self.status_var.set(status_text)
+
+        for btn in self.action_buttons:
+            try:
+                btn.config(state=state)
+            except:
+                pass # Button might be destroyed if closing
+
+    def send_command(self, func, *args, blocking=False):
+        """Queue a command."""
         if not self.is_connected:
             messagebox.showwarning("警告", "请先连接无人机")
             return
 
-        threading.Thread(target=self._run_command, args=(func, *args), daemon=True).start()
+        if self.is_executing_blocking_cmd:
+            # If busy, we reject new input as per user requirement "limit input"
+            # Alternatively, we could queue it, but user asked to "wait until finish before inputting next".
+            print("Command rejected: System is busy.")
+            return
 
-    def _run_command(self, func, *args):
-        try:
-            func(*args)
-        except Exception as e:
-            print(f"Command error: {e}")
-
-    def on_emergency(self):
-        if self.tello:
-            self.tello.emergency()
+        self.command_queue.put((func, args, blocking))
 
     def send_rc(self, lr, fb, ud, y):
-        if not self.is_connected:
-            return # Silent fail or log
-        # send_rc_control is non-blocking usually (just updates internal state in library) or fast
-        # but safely threaded
-        threading.Thread(target=self._run_command, args=(self.tello.send_rc_control, lr, fb, ud, y), daemon=True).start()
+        # RC commands are generally non-blocking for the drone (updates velocity),
+        # but we treat them as fast commands in the queue to avoid socket overlap.
+        # They are NOT 'blocking' in the sense of locking the UI.
+        # However, if a Blocking Command (Takeoff) is running, send_command check will reject this.
+        self.send_command(self.tello.send_rc_control, lr, fb, ud, y, blocking=False)
+
+    def on_emergency(self):
+        """Emergency stop - bypass queue and clear it."""
+        if self.tello:
+            # Clear queue
+            with self.command_queue.mutex:
+                self.command_queue.queue.clear()
+
+            # Send emergency immediately in a separate thread to bypass worker if it's stuck
+            threading.Thread(target=self.tello.emergency, daemon=True).start()
+
+            # Reset UI state immediately
+            self.root.after(0, lambda: self._set_ui_busy(False))
 
 if __name__ == "__main__":
     root = tk.Tk()
